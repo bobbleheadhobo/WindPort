@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import sys
 import os
@@ -10,7 +11,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-import qbittorrentapi
+import json as json_module
 
 
 # Configure logging
@@ -44,6 +45,7 @@ class WindscribePortManager:
         load_dotenv()
         self.config = self._load_config()
         self.browser = None
+        self.port = None
         
 
     def _load_config(self) -> dict:
@@ -74,11 +76,12 @@ class WindscribePortManager:
             
         logger.info("Configuration loaded successfully")
         
-        self.status_steps = {'new windscribe port' : '❌', 'update qbittorrent port' : '❌'}
+        self.status_steps = {'new windscribe port': '❌'}
         if os.getenv('docker_path'):
             config['docker_path'] = os.getenv('docker_path')
             self.status_steps['update docker env'] = '❌'
             self.status_steps['restart docker containers'] = '❌'
+        self.status_steps['update qbittorrent port'] = '❌'
         return config
     
 
@@ -105,8 +108,7 @@ class WindscribePortManager:
             )
             return element
         except TimeoutException:
-            logger.error(f"Timeout waiting for element: {value}")
-            raise
+            raise TimeoutException(f"Element {{{value}}} was not present after {timeout} seconds!")
     
 
     def _wait_for_clickable(self, by: By, value: str, timeout: int = 20):
@@ -117,8 +119,7 @@ class WindscribePortManager:
             )
             return element
         except TimeoutException:
-            logger.error(f"Timeout waiting for clickable element: {value}")
-            raise
+            raise TimeoutException(f"Element {{{value}}} was not clickable after {timeout} seconds!")
     
 
     def get_windscribe_port(self) -> str:
@@ -176,10 +177,12 @@ class WindscribePortManager:
                 # Wait for successful login by checking for account page element
                 self._wait_for_element(By.ID, "menu-account")
                 logger.info("Successfully logged into Windscribe")
-            except Exception:
-                login_error = self._wait_for_element(By.XPATH, '//*[@id="loginform"]/div/div[1]', timeout=10)
-                error_msg = f"Login failed because {login_error.text}" if login_error else "timeout exceeded"
-                raise Exception(error_msg)
+            except TimeoutException:
+                try:
+                    login_error = self._wait_for_element(By.XPATH, '//*[@id="loginform"]/div/div[1]', timeout=5)
+                    raise Exception(f"Windscribe login failed: {login_error.text}")
+                except TimeoutException:
+                    raise Exception("Windscribe login failed: timed out waiting for account menu, no error message visible on page")
             
             # Navigate to ephemeral port page
             logger.info("Navigating to ephemeral port page")
@@ -221,7 +224,8 @@ class WindscribePortManager:
                 raise ValueError(f"Invalid port received: {port}")
                 
             logger.info(f"Successfully acquired port: {port}")
-            self.status_steps['new windscribe port'] = f'✅'
+            self.status_steps['new windscribe port'] = '✅'
+            self.port = port
             return port
             
         except TimeoutException as e:
@@ -264,41 +268,61 @@ class WindscribePortManager:
             Exception: If connection or update fails
         """
 
-        logger.info("Connecting to qBittorrent")
-        
-        try:
-            # Connect to qBittorrent
-            client = qbittorrentapi.Client(
-                host=self.config['qbt_host'],
-                port=self.config['qbt_port'],
-                username=self.config['qbt_username'],
-                password=self.config['qbt_password']
-            )
-            
-            logger.info("Authenticating with qBittorrent")
+        host = self.config['qbt_host'].rstrip('/')
+        if not host.startswith('http'):
+            host = f"http://{host}"
+        port_num = self.config['qbt_port']
+        base_url = f"{host}:{port_num}"
+        logger.info(f"Connecting to qBittorrent at {base_url}")
 
-            # Attempt login
-            try:
-                client.auth_log_in()
-                logger.info("Successfully authenticated with qBittorrent")
-            except qbittorrentapi.LoginFailed as e:
-                error_msg = f"qBittorrent login failed: {str(e)}"
-                logger.error(error_msg)
-                raise Exception(error_msg) from e
-            
-            # Update port
-            logger.info(f"Updating qBittorrent port to {port}")
-            prefs = client.application.preferences
-            prefs['listen_port'] = int(port)
-            client.app.preferences = prefs
-            
-            logger.info(f"Successfully set qBittorrent listening port to {port}")
-            self.status_steps['update qbittorrent port'] = '✅'
-            return True
-            
+        try:
+            session = requests.Session()
+
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                try:
+                    # Try preferences directly — works when bypass auth for localhost is on
+                    resp = session.get(f"{base_url}/api/v2/app/preferences", timeout=10)
+
+                    if resp.status_code == 403:
+                        # Bypass auth not active, log in with credentials
+                        username = self.config['qbt_username']
+                        logger.info(f"Authenticating with qBittorrent as '{username}'")
+                        login = session.post(
+                            f"{base_url}/api/v2/auth/login",
+                            data={'username': username, 'password': self.config['qbt_password']},
+                            timeout=10
+                        )
+                        if login.text.strip() != 'Ok.':
+                            raise Exception(f"Login failed: '{login.text.strip()}'")
+                        logger.info("Successfully authenticated with qBittorrent")
+                        resp = session.get(f"{base_url}/api/v2/app/preferences", timeout=10)
+
+                    resp.raise_for_status()
+
+                    logger.info(f"Updating qBittorrent port to {port}")
+                    update = session.post(
+                        f"{base_url}/api/v2/app/setPreferences",
+                        data={'json': json_module.dumps({'listen_port': int(port)})},
+                        timeout=10
+                    )
+                    update.raise_for_status()
+
+                    logger.info(f"Successfully set qBittorrent listening port to {port}")
+                    self.status_steps['update qbittorrent port'] = '✅'
+                    return True
+
+                except Exception as e:
+                    if attempt == max_retries:
+                        raise Exception(
+                            f"qBittorrent update failed after {max_retries} attempts "
+                            f"(host: {base_url}): {str(e)}"
+                        )
+                    logger.warning(f"qBittorrent attempt {attempt}/{max_retries} failed, retrying in 5s: {str(e)}")
+                    time.sleep(5)
+
         except Exception as e:
-            error_msg = f"Failed to update qBittorrent port: {str(e)}"
-            logger.error(error_msg)
+            logger.error(str(e))
             raise
     
 
@@ -316,19 +340,23 @@ class WindscribePortManager:
         
         try:
             webhook_url = self.config['discord_webhook_url']
-            
-            # Format message with emoji based on type
-            emoji = "❌" if is_error else "✅"
-            formatted_message = f"{emoji} **Windscribe Port Manager**\n{message}"
-            
+
+            title = "❌ Port Update Failed" if is_error else "✅ Port Update Successful"
+            color = 15548997 if is_error else 5763719  # red or green
+
             payload = {
-                "content": formatted_message,
-                "username": "Windscribe Port Manager"
+                "username": "Windscribe Port Manager",
+                "embeds": [{
+                    "title": title,
+                    "description": message,
+                    "color": color,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+                }]
             }
-            
+
             response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
-            
+
             logger.info(f"Discord notification sent: {message}")
             
         except Exception as e:
@@ -408,45 +436,50 @@ class WindscribePortManager:
     
         return False  # Timeout
 
-    def run(self):
+    def run(self, port: str = None):
         """Main execution method"""
         try:
-            # Step 1: Get port from Windscribe
-            port = self.get_windscribe_port()
-            
-            # Step 2: Update qBittorrent
+            # Step 1: Get port from Windscribe (or use supplied port)
+            if port:
+                logger.info(f"Skipping Windscribe scrape, using provided port: {port}")
+                self.port = port
+                self.status_steps['new windscribe port'] = '⏭️'
+            else:
+                port = self.get_windscribe_port()
+
+            # Step 2: Update Docker network and restart containers
+            if 'docker_path' in self.config:
+                self.update_docker_network(port)
+
+            # Step 3: Update qBittorrent (after containers are confirmed healthy)
             self.update_qbittorrent_port(port)
-            
-            # Step 3: Update Docker network
-            self.update_docker_network(port)
 
             # Step 4: Send success notification
-            success_message = f"Port forwarding updated successfully!\nNew port: **{port}**\n\n"
-
+            success_message = f"New port: **{port}**\n\n"
             status_info = "\n".join([f"{value} **{key}**" for key, value in self.status_steps.items()])
             success_message += status_info
             self.send_discord_notification(success_message, is_error=False)
-            
+
             logger.info("=" * 60)
             logger.info("Windscribe Port Manager completed successfully")
             logger.info("=" * 60)
-            
+
             return 0
-            
+
         except ConfigurationError as e:
             error_message = f"Configuration Error:\n{str(e)}"
-            
-            # Print status of each step
+            if self.port:
+                error_message = f"Port acquired: **{self.port}**\n\n" + error_message
             status_info = "\n".join([f"{value} {key}" for key, value in self.status_steps.items()])
             error_message += f"\n\nStatus:\n{status_info}"
             self.send_discord_notification(error_message, is_error=True)
             logger.error("Exiting due to configuration error")
             return 1
-            
+
         except Exception as e:
             error_message = f"Error occurred:\n{str(e)}"
-            
-            # Print status of each step
+            if self.port:
+                error_message = f"Port acquired: **{self.port}**\n\n" + error_message
             status_info = "\n".join([f"{value} {key}" for key, value in self.status_steps.items()])
             error_message += f"\n\nStatus:\n{status_info}"
             self.send_discord_notification(error_message, is_error=True)
@@ -458,9 +491,13 @@ class WindscribePortManager:
 
 def main():
     """Entry point for the script"""
+    parser = argparse.ArgumentParser(description="Windscribe Port Manager")
+    parser.add_argument('--port', metavar='PORT', help='Skip Windscribe scrape and use this port directly')
+    args = parser.parse_args()
+
     try:
         manager = WindscribePortManager()
-        sys.exit(manager.run())
+        sys.exit(manager.run(port=args.port))
     except KeyboardInterrupt:
         logger.info("\nOperation cancelled by user")
         sys.exit(130)

@@ -4,3 +4,6 @@ windscribe_port_manager.log
 venv/
 downloaded_files/
 img/
+run.sh
+cronjob.log
+__pycache__/
